@@ -24,37 +24,42 @@ echo " 可道云 KODBox 手动更新工具 v2"
 echo "=========================================="
 
 VERSION="${1:-}"
+DEST="${2:-}"# 可选第二个参数：指定安装目录
 API="https://api.github.com/repos/kalcaddle/kodbox/releases/latest"
 
 # ---------- 1. 定位安装目录 ----------
 echo "[1/6] 定位 kodbox 安装目录..."
-# 先清掉可能残留的临时/解压目录，避免把解压目录误判为安装目录
 rm -rf /tmp/kb_extract /tmp/kb_dl /tmp/kodbox_new 2>/dev/null
 
 KOD_DIR=""
-for d in /tmp/kodcloud /www/kodbox /opt/kodbox /root/kodbox /usr/share/kodbox; do
-    if [ -f "$d/config/version.php" ]; then KOD_DIR="$d"; break; fi
-done
-if [ -z "$KOD_DIR" ]; then
-    for base in /mnt/*/ /www/ /opt/ /root/ /home/*/; do
-        if [ -f "${base}kodcloud/config/version.php" ]; then KOD_DIR="${base}kodcloud"; break; fi
-        if [ -f "${base}kodbox/config/version.php" ]; then KOD_DIR="${base}kodbox"; break; fi
-    done
-fi
-if [ -z "$KOD_DIR" ]; then
-    # find 时排除 /tmp 下的临时与解压目录
-    KOD_DIR=$(find / -maxdepth 7 -type f -path '*/config/version.php' 2>/dev/null \
-              | grep -v '^/tmp/kb' | grep -v '^/tmp/kodbox_new' | head -n1 | sed 's|/config/version.php||')
-fi
-if [ -z "$KOD_DIR" ] || [ ! -d "$KOD_DIR" ]; then
-    echo "  ! 未找到已安装的 kodbox，将安装到默认位置 /tmp/kodcloud"
-    echo "    （LuCI「同步与备份」里的项目目录需设为 /tmp/kodcloud）"
-    KOD_DIR="/tmp/kodcloud"
+# 1) 命令行指定优先
+if [ -n "$DEST" ]; then
+    KOD_DIR="$DEST"
+    echo "  使用命令行指定目录: $KOD_DIR"
+else
+    # 2) 读取 LuCI 已配置的 project_directory（这才是真正的 web 根目录）
+    CFG="$(uci -q get kodexplorer.@global[0].project_directory 2>/dev/null)"
+    if [ -n "$CFG" ] && [ -d "$CFG" ]; then
+        KOD_DIR="$CFG"
+        echo "  使用 LuCI 项目目录: $KOD_DIR"
+    fi
+    # 3) 回退：扫常见位置（注意是 <dir>/config/version.php）
+    if [ -z "$KOD_DIR" ]; then
+        for d in /mnt/*/ /www/kodbox /opt/kodbox /usr/share/kodbox /tmp/kodcloud; do
+            if [ -f "${d%/}/config/version.php" ]; then KOD_DIR="${d%/}"; break; fi
+        done
+        [ -n "$KOD_DIR" ] && echo "  自动探测到: $KOD_DIR"
+    fi
+    # 4) 都没找到 -> 默认装到 /mnt/mmcblk1p4（持久化存储，重启不丢）
+    if [ -z "$KOD_DIR" ]; then
+        KOD_DIR="/mnt/mmcblk1p4"
+        echo "  未找到现有安装，装到默认位置: $KOD_DIR"
+    fi
 fi
 echo "  安装目录: $KOD_DIR"
 
 CUR_VER=""
-[ -f "$KOD_DIR/config/version.php" ] && CUR_VER=$(grep KOD_VERSION "'" "$KOD_DIR/config/version.php" 2>/dev/null | head -1 | cut -d"'" -f4)
+[ -f "$KOD_DIR/config/version.php" ] && CUR_VER=$(grep "define(.KOD_VERSION"  "$KOD_DIR/config/version.php" 2>/dev/null | head -1 | cut -d"'" -f4)
 echo "  当前版本: ${CUR_VER:-（未安装/无法读取）}"
 
 # ---------- 2. 确定目标版本 ----------
@@ -99,24 +104,35 @@ if ! tar xzf kb.tar.gz -C kb_extract 2>/dev/null; then
     exit 1
 fi
 # 真实内容目录（tarball 内有一层 kodbox-<version>/）
-SRC_DIR=$(find /tmp/kb_extract -maxdepth 2 -type f -name 'version.php' -path '*/config/*' 2>/dev/null | head -n1 | sed 's|/config/version.php||')
-if [ -z "$SRC_DIR" ] || [ ! -d "$SRC_DIR" ]; then
-    SRC_DIR=$(ls -d /tmp/kb_extract/*/ 2>/dev/null | head -n1)
+# 注意：busybox find 不支持 -path，这里直接取唯一子目录
+SRC_DIR=$(ls -d /tmp/kb_extract/*/ 2>/dev/null | head -n1)
+if [ -z "$SRC_DIR" ]; then
+    echo "  ✗ 解压后未找到内容目录"
+    exit 1
 fi
-if [ -z "$SRC_DIR" ] || [ ! -f "$SRC_DIR/index.php" ]; then
-    echo "  ✗ 解压后内容不完整（缺 index.php）"
+if [ ! -f "${SRC_DIR}config/version.php" ] || [ ! -f "${SRC_DIR}index.php" ]; then
+    echo "  ✗ 解压后内容不完整（缺 index.php 或 config/version.php）"
     exit 1
 fi
 echo "  ✓ 解压完成: $SRC_DIR"
 
 # ---------- 6. 备份 + 覆盖 ----------
 echo "[6/6] 备份并安装..."
-BACKUP="/tmp/kodbox_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
-if [ -d "$KOD_DIR" ] && [ -f "$KOD_DIR/config/version.php" ]; then
-    tar czf "$BACKUP" -C "$(dirname "$KOD_DIR")" "$(basename "$KOD_DIR")" 2>/dev/null || true
-    echo "  ✓ 已备份到: $BACKUP"
+# 仅在已安装过时才备份（避免把整个 /mnt 分区打包）
+if [ -f "$KOD_DIR/config/version.php" ]; then
+    BACKUP="${TMPDIR:-/tmp}/kodbox_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+    # 只备份 kodbox 自身文件，不打包整个目录（目录里可能有 AdGuardHome 等其它内容）
+    tar czf "$BACKUP" -C "$KOD_DIR" \
+        index.php app config plugins static data ChangeLog.md 2>/dev/null || true
+    if [ -f "$BACKUP" ]; then
+        echo "  ✓ 已备份 kodbox 文件到: $BACKUP"
+    else
+        echo "  ! 备份失败（不影响安装）"
+        BACKUP=""
+    fi
 else
-    echo "  ! 原目录不存在，跳过备份"
+    echo "  ! 首次安装，无需备份"
+    BACKUP=""
 fi
 
 mkdir -p "$KOD_DIR"
@@ -133,23 +149,33 @@ if [ -f /tmp/kod_local_config.php.bak ]; then
     rm -f /tmp/kod_local_config.php.bak
 fi
 
-chown -R www:www "$KOD_DIR" 2>/dev/null || true
+# 只改 kodbox 自身目录的属主（KOD_DIR 里可能还有 AdGuardHome 等其它应用，
+# 不能 chown -R 整个目录，否则会破坏别人的权限）
+for sub in app config data plugins static index.php; do
+    [ -e "$KOD_DIR/$sub" ] && chown -R www:www "$KOD_DIR/$sub" 2>/dev/null
+done
+
 rm -rf /tmp/kb_dl /tmp/kb_extract /tmp/kb.tar.gz /tmp/kodbox_new
 
-# 重启 web 服务
-/etc/init.d/php-fpm restart 2>/dev/null || \
-  /etc/init.d/php8-fpm restart 2>/dev/null || \
-  /etc/init.d/php7-fpm restart 2>/dev/null || true
-/etc/init.d/nginx restart 2>/dev/null || /etc/init.d/uhttpd restart 2>/dev/null || true
+# 重启可道云服务（若已安装该 init 脚本）
+if [ -x /etc/init.d/kodexplorer ]; then
+    /etc/init.d/kodexplorer stop2>/dev/null || /etc/init.d/kodexplorer stop 2>/dev/null
+    sleep 2
+    /etc/init.d/kodexplorer start 2>/dev/null
+    echo "  ✓ 已重启 kodexplorer 服务"
+fi
+# 注意：不要重启全局 php-fpm / nginx —— 盒子上还有 AdGuardHome 等其它服务在用，
+# kodexplorer 使用自己独立的 php-fpm 实例与 nginx 配置（端口 8080）。
+
 sleep 2
 
-NEW_VER=$(grep KOD_VERSION "'" "$KOD_DIR/config/version.php" 2>/dev/null | head -1 | cut -d"'" -f4)
+NEW_VER=$(grep "define(.KOD_VERSION"  "$KOD_DIR/config/version.php" 2>/dev/null | head -1 | cut -d"'" -f4)
 echo ""
 echo "=========================================="
 echo " ✓ 安装完成"
 echo "   目录  : $KOD_DIR"
 echo "   版本  : ${CUR_VER:-无} -> ${NEW_VER:-未知}"
-[ -f "$BACKUP" ] && echo "   备份  : $BACKUP"
+[ -n "$BACKUP" ] && [ -f "$BACKUP" ] && echo "   备份  : $BACKUP"
 echo ""
 echo " 请刷新可道云页面确认版本。"
 echo " 若页面版本未变，请在 LuCI 同步与备份中确认"
