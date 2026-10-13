@@ -8,15 +8,25 @@
 #   3) 故改从 GitHub 官方仓库拉取源码部署（tarball 方式，不依赖 git）
 #
 # 用法：
-#   sh kodbox-update.sh              # 自动获取最新版
+#   sh kodbox-update.sh                    # 自动获取最新版，装到 LuCI 配置的目录
 #   sh kodbox-update.sh 1.70.03# 指定版本
+#   sh kodbox-update.sh 1.70.03 /mnt/mmcblk1p4   # 同时指定安装目录
 #
-# v2 修复（实测发现的 3 个问题）：
-#   1) 盒子未安装 git -> 改用 GitHub tarball 下载，不再依赖 git
+# 安装目录优先级：
+#   1) 命令行第二个参数
+#   2) LuCI 「同步与备份」里 kodexplorer 的 project_directory（真正的 web 根目录）
+#   3) 常见位置探测
+#   4) 默认 /mnt/mmcblk1p4
+#
+# v3 修复（实测踩坑记录）：
+#   1) 盒子未安装 git          -> 改用 GitHub tarball，不依赖 git
 #   2) busybox tar 不支持 --strip-components -> 解压后进子目录取真实路径
-#   3) config.php 实际在 config/ 子目录，不在顶层 -> 修正完整性校验路径
+#   3) config.php 在 config/ 子目录，不在顶层-> 修正完整性校验路径
+#   4) 插件目录嵌套导致拍平错乱-> 改为逐项 chown，只改 kodbox 自身目录
+#   5) 打包整个挂载点风险极大  -> 改为只备份 kodbox 自身文件
 #
-# ⚠️ 会自动备份原目录到 /tmp/kodbox_backup_<时间戳>.tar.gz
+# ⚠️ 会自动备份原目录（只含 kodbox 文件）到 /tmp/kodbox_backup_<时间戳>.tar.gz
+# ⚠️ 注意：/tmp 在 OpenWrt 是内存盘（tmpfs），重启即失效，备份请及时取回。
 # =============================================================================
 
 echo "=========================================="
